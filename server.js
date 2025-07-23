@@ -2,20 +2,58 @@ require('dotenv').config();
 const express = require('express');
 const multer = require('multer');
 const axios = require('axios');
+const crypto = require('crypto');
 
 const app = express();
 const upload = multer();
 
-const PORT = 8000;
+const PORT = process.env.PORT || 8000;
 
 // Middleware
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+// Verify SendGrid webhook signature
+function verifyWebhookSignature(payload, signature, timestamp) {
+  if (!process.env.SENDGRID_WEBHOOK_PUBLIC_KEY) {
+    console.warn('Warning: SENDGRID_WEBHOOK_PUBLIC_KEY not set - skipping signature verification');
+    return true; // Allow through if no key is configured
+  }
+  
+  try {
+    const timestampPayload = timestamp + payload;
+    const decodedSignature = Buffer.from(signature, 'base64');
+    
+    const verifier = crypto.createVerify('ecdsa-with-SHA256');
+    verifier.update(timestampPayload, 'utf8');
+    
+    return verifier.verify(process.env.SENDGRID_WEBHOOK_PUBLIC_KEY, decodedSignature);
+  } catch (error) {
+    console.error('Signature verification error:', error);
+    return false;
+  }
+}
+
 // SendGrid webhook endpoint
 app.post('/sendgrid/webhook', upload.any(), async (req, res) => {
   try {
     console.log('Received webhook from SendGrid');
+    
+    // Verify webhook signature for security
+    const signature = req.get('X-Twilio-Email-Event-Webhook-Signature');
+    const timestamp = req.get('X-Twilio-Email-Event-Webhook-Timestamp');
+    
+    if (signature && timestamp) {
+      const payload = JSON.stringify(req.body);
+      if (!verifyWebhookSignature(payload, signature, timestamp)) {
+        console.error('Invalid webhook signature');
+        return res.status(401).send('Unauthorized');
+      }
+      console.log('Webhook signature verified ✓');
+    } else {
+      console.warn('No signature headers found - webhook may not be authenticated');
+    }
+    
     console.log('Available fields:', Object.keys(req.body));
     
     // Extract email data from SendGrid webhook
