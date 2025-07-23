@@ -57,7 +57,7 @@ app.post('/sendgrid/webhook', upload.any(), async (req, res) => {
     console.log('Available fields:', Object.keys(req.body));
     
     // Extract email data from SendGrid webhook
-    const { from, to, subject, email } = req.body;
+    const { from, to, subject, email, cc } = req.body;
     
     if (!from || !email) {
       console.log('Missing required fields');
@@ -68,17 +68,42 @@ app.post('/sendgrid/webhook', upload.any(), async (req, res) => {
     const textMatch = email.match(/Content-Type: text\/plain[^]*?\r?\n\r?\n([^]*?)(?=\r?\n--|\r?\n$)/);
     const emailText = textMatch ? textMatch[1].trim() : 'No text content found';
 
+    // Extract all recipients for reply-all
+    const allRecipients = [from]; // Always include the sender
+    
+    // Add original TO recipients (excluding our address)
+    if (to) {
+      const toEmails = to.split(',').map(email => email.trim());
+      toEmails.forEach(email => {
+        if (email && email !== process.env.FROM_EMAIL && !allRecipients.includes(email)) {
+          allRecipients.push(email);
+        }
+      });
+    }
+    
+    // Add CC recipients
+    if (cc) {
+      const ccEmails = cc.split(',').map(email => email.trim());
+      ccEmails.forEach(email => {
+        if (email && email !== process.env.FROM_EMAIL && !allRecipients.includes(email)) {
+          allRecipients.push(email);
+        }
+      });
+    }
+
     console.log(`Email from: ${from}`);
     console.log(`Email to: ${to}`);
+    console.log(`Email cc: ${cc || 'none'}`);
+    console.log(`Reply-all recipients: ${allRecipients.join(', ')}`);
     console.log(`Subject: ${subject}`);
     console.log(`Text content: ${emailText}`);
 
     // Send to Claude API
-    const claudeResponse = await getClaudeResponse(emailText, subject, from);
+    const claudeResponse = await getClaudeResponse(emailText, subject, from, allRecipients);
     console.log('Claude response received');
 
-    // Send reply via SendGrid
-    await sendReply(from, subject, claudeResponse);
+    // Send reply-all via SendGrid
+    await sendReplyAll(allRecipients, subject, claudeResponse);
     console.log('Reply sent successfully');
 
     res.status(200).send('OK');
@@ -89,7 +114,7 @@ app.post('/sendgrid/webhook', upload.any(), async (req, res) => {
 });
 
 // Get response from Claude
-async function getClaudeResponse(emailText, subject, fromEmail) {
+async function getClaudeResponse(emailText, subject, fromEmail, allRecipients) {
   try {
     // Extract name from "Name <email@domain.com>" format
     let senderName = "Esteemed Correspondent";
@@ -101,11 +126,18 @@ async function getClaudeResponse(emailText, subject, fromEmail) {
       senderName = fromEmail.split('@')[0];
     }
 
+    // Create context about all recipients for Claude
+    const recipientCount = allRecipients.length;
+    let recipientContext = "";
+    if (recipientCount > 1) {
+      recipientContext = ` This email was sent to ${recipientCount} recipients including yourself, so you are responding to everyone on the thread with your characteristic pompous formality.`;
+    }
+
     const prompt = `You received an email from ${senderName} (${fromEmail}) with the subject "${subject}". Here is the email content:
 
 ${emailText}
 
-Please respond to this email in an EXTREMELY formal, overly polite, and pompously verbose manner - like a Victorian aristocrat or stuffy British butler might write. Use elaborate language, unnecessarily complex vocabulary, and be ridiculously courteous to a comical degree. 
+Please respond to this email in an EXTREMELY formal, overly polite, and pompously verbose manner - like a Victorian aristocrat or stuffy British butler might write. Use elaborate language, unnecessarily complex vocabulary, and be ridiculously courteous to a comical degree.${recipientContext}
 
 Address the sender by name (${senderName}) in your response and be sure to acknowledge them with excessive formality and reverence.
 
@@ -152,12 +184,14 @@ Use the email_response tool to structure your response. Do NOT include the subje
   }
 }
 
-// Send reply via SendGrid
-async function sendReply(toEmail, originalSubject, responseText) {
+// Send reply-all via SendGrid
+async function sendReplyAll(allRecipients, originalSubject, responseText) {
   try {
-    // Extract just the email address from "Name <email@domain.com>" format
-    const emailMatch = toEmail.match(/<([^>]+)>/) || [null, toEmail];
-    const cleanEmail = emailMatch[1];
+    // Clean email addresses and remove duplicates
+    const cleanRecipients = allRecipients.map(email => {
+      const emailMatch = email.match(/<([^>]+)>/) || [null, email];
+      return emailMatch[1];
+    }).filter((email, index, self) => self.indexOf(email) === index); // Remove duplicates
 
     const replySubject = originalSubject.startsWith('Re: ') 
       ? originalSubject 
@@ -165,7 +199,7 @@ async function sendReply(toEmail, originalSubject, responseText) {
 
     const emailData = {
       personalizations: [{
-        to: [{ email: cleanEmail }]
+        to: cleanRecipients.map(email => ({ email }))
       }],
       from: { email: process.env.FROM_EMAIL || 'claude@example.com' },
       subject: replySubject,
@@ -175,7 +209,7 @@ async function sendReply(toEmail, originalSubject, responseText) {
       }]
     };
 
-    console.log('Sending email to:', cleanEmail);
+    console.log('Sending reply-all to:', cleanRecipients.join(', '));
     console.log('Email data:', JSON.stringify(emailData, null, 2));
 
     const response = await axios.post('https://api.sendgrid.com/v3/mail/send', emailData, {
@@ -188,12 +222,17 @@ async function sendReply(toEmail, originalSubject, responseText) {
     console.log('SendGrid response status:', response.status);
     console.log('SendGrid response headers:', response.headers);
   } catch (error) {
-    console.error('Error sending reply:');
+    console.error('Error sending reply-all:');
     console.error('Status:', error.response?.status);
     console.error('Data:', error.response?.data);
     console.error('Message:', error.message);
     throw error;
   }
+}
+
+// Legacy function for backwards compatibility
+async function sendReply(toEmail, originalSubject, responseText) {
+  return sendReplyAll([toEmail], originalSubject, responseText);
 }
 
 // Health check endpoint
